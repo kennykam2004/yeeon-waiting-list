@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 
 export default function LoginPage() {
@@ -8,7 +7,6 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
-  const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -17,7 +15,7 @@ export default function LoginPage() {
 
     try {
       await login(email, password);
-      navigate('/');
+      window.location.href = '/';
     } catch (err) {
       setError('電子郵件或密碼錯誤');
     } finally {
@@ -77,11 +75,8 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <p className="text-center mt-6 text-gray-600">
-          還沒有帳戶？{' '}
-          <Link to="/register" className="text-emerald-600 hover:text-emerald-800 font-semibold">
-            立即註冊
-          </Link>
+        <p className="text-center mt-6 text-gray-500 text-sm">
+          請聯絡管理員開通帳戶
         </p>
       </div>
     </div>

@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebase/config';
+import AdminPage from './AdminPage';
 
 const initialData = [
   { id: '1', targetBranch: ['頤安'], name: '王大明', age: 75, gender: '男', registerDate: '2026-05-10', contactName: '王小明(子)', contactPhone: '66112233', region: '澳門區', address: '筷子基北灣', medicalHistory: '高血壓，輕微中風，行動緩慢', remarks: '家屬需上班無人照顧', status: '新登記', evaluationDate: '', evaluationComments: '' },
@@ -23,6 +24,7 @@ const regionOptions = ['澳門區', '氹仔區', '路環區', '山頂醫院', '�
 export default function Dashboard() {
   const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState('list');
+  const [isAdmin, setIsAdmin] = useState(false);
   const [patients, setPatients] = useState([]);
   const [selectedPatient, setSelectedPatient] = useState(null);
 
@@ -46,6 +48,19 @@ export default function Dashboard() {
   });
 
   const [loading, setLoading] = useState(true);
+
+  // 檢查是否為管理員
+  useEffect(() => {
+    const checkAdmin = async () => {
+      if (!user) return;
+      // 管理員 email 比對
+      const adminEmail = 'kennykam2004@gmail.com';
+      const userEmail = user.email ? user.email.toLowerCase() : '';
+      const adminEmailLower = adminEmail.toLowerCase();
+      setIsAdmin(userEmail === adminEmailLower);
+    };
+    checkAdmin();
+  }, [user]);
 
   useEffect(() => {
     if (!user) return;
@@ -196,7 +211,9 @@ export default function Dashboard() {
   const filteredPatients = useMemo(() => {
     const filtered = patients.filter(p => {
       const matchBranch = filterBranch === 'All' || p.targetBranch.includes(filterBranch) || p.targetBranch.includes('三院皆可');
-      const matchStatus = filterStatus === 'All' || p.status === filterStatus;
+      const matchStatus = filterStatus === 'All'
+        ? p.status !== '已刪除'  // 全部狀態時隱藏已刪除
+        : p.status === filterStatus;
       const matchGender = filterGender === 'All' || p.gender === filterGender;
       const matchYear = filterYear === 'All' || (p.registerDate && p.registerDate.startsWith(filterYear));
 
@@ -625,6 +642,18 @@ export default function Dashboard() {
             + 新增登記
           </button>
 
+          {isAdmin && (
+            <>
+              <div className="border-l border-emerald-500 h-6 mx-2"></div>
+              <button
+                onClick={() => setActiveTab('admin')}
+                className={`px-4 py-2 rounded ${activeTab === 'admin' ? 'bg-purple-700' : 'bg-purple-600 hover:bg-purple-700'}`}
+              >
+                用戶管理
+              </button>
+            </>
+          )}
+
           <div className="border-l border-emerald-500 h-6 mx-2"></div>
 
           <input
@@ -842,6 +871,10 @@ export default function Dashboard() {
             </div>
             {renderFormUI(false)}
           </div>
+        )}
+
+        {activeTab === 'admin' && (
+          <AdminPage onBack={() => setActiveTab('list')} />
         )}
       </main>
 
