@@ -48,6 +48,17 @@ export default function Dashboard() {
   });
 
   const [loading, setLoading] = useState(true);
+  const [saveMessage, setSaveMessage] = useState('');
+
+  // 統計各狀態數量
+  const statusCounts = useMemo(() => {
+    const counts = {};
+    statuses.forEach(s => counts[s] = 0);
+    patients.forEach(p => {
+      if (counts[p.status] !== undefined) counts[p.status]++;
+    });
+    return counts;
+  }, [patients]);
 
   // 檢查是否為管理員
   useEffect(() => {
@@ -66,7 +77,7 @@ export default function Dashboard() {
     if (!user) return;
 
     const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-    const patientsRef = collection(db, 'artifacts', appId, 'users', user.uid, 'patients');
+    const patientsRef = collection(db, 'patients');
 
     const unsubscribe = onSnapshot(patientsRef, (snapshot) => {
       const fetchedPatients = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -129,12 +140,16 @@ export default function Dashboard() {
 
     try {
       const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-      const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'patients', docId);
+      const docRef = doc(db, 'patients', docId);
       await setDoc(docRef, patientData);
+      setSaveMessage('✓ 資料已儲存');
+      setTimeout(() => setSaveMessage(''), 3000);
       setActiveTab('list');
       resetForm();
     } catch (error) {
       console.error('儲存資料失敗:', error);
+      setSaveMessage('✗ 儲存失敗');
+      setTimeout(() => setSaveMessage(''), 3000);
     }
   };
 
@@ -156,7 +171,7 @@ export default function Dashboard() {
     if (patientToDelete && user) {
       try {
         const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'patients', patientToDelete.id);
+        const docRef = doc(db, 'patients', patientToDelete.id);
         await updateDoc(docRef, { status: '已刪除' });
         setPatientToDelete(null);
       } catch (error) {
@@ -171,7 +186,7 @@ export default function Dashboard() {
     try {
       const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
       for (const p of initialData) {
-        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'patients', p.id);
+        const docRef = doc(db, 'patients', p.id);
         await setDoc(docRef, p);
       }
     } catch (e) {
@@ -281,7 +296,7 @@ export default function Dashboard() {
           const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
           await Promise.all(importedData.map(async (p) => {
             if (p.id) {
-              const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'patients', p.id);
+              const docRef = doc(db, 'patients', p.id);
               await setDoc(docRef, p);
             }
           }));
@@ -403,7 +418,7 @@ export default function Dashboard() {
           };
 
           const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-          const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'patients', patient.id);
+          const docRef = doc(db, 'patients', patient.id);
           writePromises.push(setDoc(docRef, patient));
           totalImported++;
         }
@@ -618,10 +633,16 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans pb-10">
-      <header className="bg-emerald-700 text-white p-4 shadow-md flex justify-between items-center sticky top-0 z-40">
-        <h1 className="text-xl font-bold">頤安三院輪候及評估管理系統</h1>
-        <div className="space-x-2 flex items-center">
+      <header className="bg-emerald-700 text-white p-2 sm:p-4 shadow-md sticky top-0 z-40">
+        <div className="flex flex-wrap justify-between items-center gap-2">
+          <h1 className="text-lg sm:text-xl font-bold">頤安三院輪候及評估管理系統</h1>
+          <div className="flex items-center gap-1 sm:gap-2 flex-wrap">
           <span className="text-sm opacity-80 mr-2">{user?.email}</span>
+          {saveMessage && (
+            <span className={`text-sm font-semibold px-2 py-1 rounded ${saveMessage.includes('✗') ? 'bg-red-500' : 'bg-green-500'}`}>
+              {saveMessage}
+            </span>
+          )}
           <button
             onClick={handleLogout}
             className="px-4 py-2 rounded bg-red-600 hover:bg-red-700 font-semibold"
@@ -697,6 +718,7 @@ export default function Dashboard() {
           >
             導出 Excel
           </button>
+          </div>
         </div>
       </header>
 
@@ -747,6 +769,33 @@ export default function Dashboard() {
                 <span className="text-sm text-gray-500 bg-gray-100 px-3 py-2 rounded">
                   共 {filteredPatients.length} 筆資料
                 </span>
+              </div>
+            </div>
+
+            {/* 狀態統計 */}
+            <div className="bg-white rounded shadow p-4">
+              <h3 className="text-sm font-semibold text-gray-600 mb-3">各狀態統計</h3>
+              <div className="flex flex-wrap gap-2">
+                {statuses.filter(s => s !== '已刪除').map(status => (
+                  <span
+                    key={status}
+                    className={`px-3 py-1 rounded-full text-sm font-medium cursor-pointer transition-all ${
+                      filterStatus === status
+                        ? 'ring-2 ring-emerald-500'
+                        : 'hover:ring-1 ring-gray-300'
+                    } ${
+                      status === '適合輪候' ? 'bg-green-100 text-green-800' :
+                      status === '評估預約中' ? 'bg-blue-100 text-blue-800' :
+                      status === '新登記' ? 'bg-yellow-100 text-yellow-800' :
+                      status === '已入住' ? 'bg-purple-100 text-purple-800' :
+                      status === '已取消' ? 'bg-gray-200 text-gray-600' :
+                      'bg-gray-100 text-gray-700'
+                    }`}
+                    onClick={() => setFilterStatus(filterStatus === status ? 'All' : status)}
+                  >
+                    {status}: {statusCounts[status]}
+                  </span>
+                ))}
               </div>
             </div>
 
@@ -805,10 +854,10 @@ export default function Dashboard() {
                       </td>
                     </tr>
                   ) : (
-                    filteredPatients.map(p => (
+                    filteredPatients.map((p, idx) => (
                       <React.Fragment key={p.id}>
                         <tr
-                          className={`border-b transition-colors cursor-pointer ${selectedPatient?.id === p.id ? 'bg-emerald-100' : 'hover:bg-emerald-50'}`}
+                          className={`border-b transition-colors cursor-pointer ${selectedPatient?.id === p.id ? 'bg-emerald-100' : idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-emerald-50`}
                           onClick={() => selectedPatient?.id === p.id ? setSelectedPatient(null) : openPatientModal(p)}
                         >
                           <td className="p-3">
