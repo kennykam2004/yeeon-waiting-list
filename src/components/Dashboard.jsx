@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { useToast } from './Toast';
 import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import AdminPage from './AdminPage';
@@ -21,25 +22,45 @@ const branches = ['頤安', '雅新', '逸麗', '三院皆可'];
 const statuses = ['新登記', '評估預約中', '適合輪候', '已入住', '已評估(不適合/其他)', '家屬未考慮清楚', '未能聯絡', '已取消', '已刪除'];
 const regionOptions = ['澳門區', '氹仔區', '路環區', '山頂醫院', '鏡湖醫院', '九澳工聯', '高頂', '其他/未知'];
 
+const statusStyles = {
+  '已刪除': { bg: 'bg-rose-100', text: 'text-rose-700', ring: 'ring-rose-200' },
+  '已入住': { bg: 'bg-violet-100', text: 'text-violet-700', ring: 'ring-violet-200' },
+  '適合輪候': { bg: 'bg-emerald-100', text: 'text-emerald-700', ring: 'ring-emerald-200' },
+  '評估預約中': { bg: 'bg-sky-100', text: 'text-sky-700', ring: 'ring-sky-200' },
+  '已取消': { bg: 'bg-slate-100', text: 'text-slate-600', ring: 'ring-slate-200' },
+  '家屬未考慮清楚': { bg: 'bg-amber-100', text: 'text-amber-700', ring: 'ring-amber-200' },
+  '未能聯絡': { bg: 'bg-orange-100', text: 'text-orange-700', ring: 'ring-orange-200' },
+  '新登記': { bg: 'bg-blue-100', text: 'text-blue-700', ring: 'ring-blue-200' },
+  '已評估(不適合/其他)': { bg: 'bg-gray-100', text: 'text-gray-600', ring: 'ring-gray-200' },
+};
+
 export default function Dashboard() {
   const { user, logout } = useAuth();
+  const { addToast } = useToast();
   const [activeTab, setActiveTab] = useState('list');
   const [isAdmin, setIsAdmin] = useState(false);
   const [patients, setPatients] = useState([]);
   const [selectedPatient, setSelectedPatient] = useState(null);
-
   const [filterBranch, setFilterBranch] = useState('All');
   const [filterStatus, setFilterStatus] = useState('All');
   const [filterGender, setFilterGender] = useState('All');
   const [filterYear, setFilterYear] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [patientToDelete, setPatientToDelete] = useState(null);
   const [convertTwToCn, setConvertTwToCn] = useState(null);
-
   const [sortConfig, setSortConfig] = useState({ key: 'registerDate', direction: 'desc' });
+  const [loading, setLoading] = useState(true);
+  const [isLocalMode, setIsLocalMode] = useState(false);
+  const [formDirty, setFormDirty] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [pageSize, setPageSize] = useState(10);
+  const [currentPage, setCurrentPage] = useState(1);
 
   const fileInputRef = useRef(null);
   const excelInputRef = useRef(null);
+  const formRef = useRef(null);
+  const tableRef = useRef(null);
 
   const [formData, setFormData] = useState({
     targetBranch: ['三院皆可'], name: '', age: '', gender: '女', registerDate: new Date().toISOString().split('T')[0],
@@ -47,10 +68,6 @@ export default function Dashboard() {
     status: '新登記', evaluationDate: '', evaluationComments: ''
   });
 
-  const [loading, setLoading] = useState(true);
-  const [saveMessage, setSaveMessage] = useState('');
-
-  // 統計各狀態數量
   const statusCounts = useMemo(() => {
     const counts = {};
     statuses.forEach(s => counts[s] = 0);
@@ -60,11 +77,9 @@ export default function Dashboard() {
     return counts;
   }, [patients]);
 
-  // 檢查是否為管理員
   useEffect(() => {
     const checkAdmin = async () => {
       if (!user) return;
-      // 管理員 email 比對
       const adminEmail = 'kennykam2004@gmail.com';
       const userEmail = user.email ? user.email.toLowerCase() : '';
       const adminEmailLower = adminEmail.toLowerCase();
@@ -72,6 +87,99 @@ export default function Dashboard() {
     };
     checkAdmin();
   }, [user]);
+
+  // Debounce search query
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(searchQuery);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Auto-focus form first field when new tab opens
+  useEffect(() => {
+    if (activeTab === 'new' && formRef.current) {
+      const firstInput = formRef.current.querySelector('input[name="name"]');
+      if (firstInput) setTimeout(() => firstInput.focus(), 100);
+    }
+  }, [activeTab]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setSelectedPatient(null);
+        setPatientToDelete(null);
+      }
+      if (e.ctrlKey && e.key === 'n') {
+        e.preventDefault();
+        setActiveTab('new');
+        resetForm();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Persist filter settings to localStorage
+  useEffect(() => {
+    const saved = localStorage.getItem('careHomeFilters');
+    if (saved) {
+      try {
+        const { filterBranch: sb, filterStatus: ss, filterGender: sg, filterYear: sy } = JSON.parse(saved);
+        if (sb) setFilterBranch(sb);
+        if (ss) setFilterStatus(ss);
+        if (sg) setFilterGender(sg);
+        if (sy) setFilterYear(sy);
+      } catch (e) {}
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('careHomeFilters', JSON.stringify({
+      filterBranch, filterStatus, filterGender, filterYear
+    }));
+  }, [filterBranch, filterStatus, filterGender, filterYear]);
+
+  // Click outside to close expanded row
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (selectedPatient && tableRef.current && !tableRef.current.contains(e.target)) {
+        const isInsideExpandedRow = e.target.closest('tr.bg-white');
+        if (!isInsideExpandedRow) {
+          setSelectedPatient(null);
+        }
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [selectedPatient]);
+
+  // Unsaved changes warning
+  useEffect(() => {
+    const handleBeforeUnload = (e) => {
+      if (formDirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [formDirty]);
+
+  // Persist sort config
+  useEffect(() => {
+    const saved = localStorage.getItem('careHomeSort');
+    if (saved) {
+      try {
+        setSortConfig(JSON.parse(saved));
+      } catch (e) {}
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('careHomeSort', JSON.stringify(sortConfig));
+  }, [sortConfig]);
 
   useEffect(() => {
     if (!user) return;
@@ -83,8 +191,10 @@ export default function Dashboard() {
       const fetchedPatients = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setPatients(fetchedPatients);
       setLoading(false);
+      setIsLocalMode(false);
     }, (error) => {
       console.error('讀取資料失敗: ', error);
+      setIsLocalMode(true);
       setLoading(false);
     });
 
@@ -106,6 +216,7 @@ export default function Dashboard() {
   const handleInputChange = (e) => {
     const { name, value } = e.target;
     setFormData(prev => ({ ...prev, [name]: value }));
+    setFormDirty(true);
   };
 
   const handleBranchChange = (branch) => {
@@ -122,14 +233,14 @@ export default function Dashboard() {
         }
       }
       if (newBranches.length === 0) newBranches = ['三院皆可'];
+      setFormDirty(true);
       return { ...prev, targetBranch: newBranches };
     });
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!user) return;
-
+    setIsSaving(true);
     const patientData = { ...formData };
     let docId = patientData.id;
 
@@ -139,17 +250,29 @@ export default function Dashboard() {
     }
 
     try {
-      const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-      const docRef = doc(db, 'patients', docId);
-      await setDoc(docRef, patientData);
-      setSaveMessage('✓ 資料已儲存');
-      setTimeout(() => setSaveMessage(''), 3000);
+      if (isLocalMode) {
+        setPatients(prev => {
+          const existing = prev.findIndex(p => p.id === docId);
+          if (existing >= 0) {
+            const updated = [...prev];
+            updated[existing] = patientData;
+            return updated;
+          }
+          return [...prev, patientData];
+        });
+        addToast('資料已儲存（本地模式）', 'success');
+      } else {
+        const docRef = doc(db, 'patients', docId);
+        await setDoc(docRef, patientData);
+        addToast('資料已儲存', 'success');
+      }
       setActiveTab('list');
       resetForm();
     } catch (error) {
       console.error('儲存資料失敗:', error);
-      setSaveMessage('✗ 儲存失敗');
-      setTimeout(() => setSaveMessage(''), 3000);
+      addToast('儲存失敗，請稍後再試', 'error');
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -160,6 +283,7 @@ export default function Dashboard() {
       status: '新登記', evaluationDate: '', evaluationComments: ''
     });
     setSelectedPatient(null);
+    setFormDirty(false);
   };
 
   const openPatientModal = (patient) => {
@@ -168,29 +292,54 @@ export default function Dashboard() {
   };
 
   const confirmDelete = async () => {
-    if (patientToDelete && user) {
-      try {
-        const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
+    if (!patientToDelete) return;
+    try {
+      if (isLocalMode) {
+        setPatients(prev => prev.map(p =>
+          p.id === patientToDelete.id ? { ...p, status: '已刪除' } : p
+        ));
+        addToast(`已將 ${patientToDelete.name} 移至已刪除（本地模式）`, 'warning');
+      } else {
         const docRef = doc(db, 'patients', patientToDelete.id);
         await updateDoc(docRef, { status: '已刪除' });
-        setPatientToDelete(null);
-      } catch (error) {
-        console.error('更新刪除狀態失敗:', error);
+        addToast(`已將 ${patientToDelete.name} 移至已刪除`, 'success');
       }
+      setPatientToDelete(null);
+    } catch (error) {
+      console.error('更新刪除狀態失敗:', error);
+      addToast('刪除失敗，請稍後再試', 'error');
     }
   };
 
   const loadSampleData = async () => {
-    if (!user) return;
     setLoading(true);
     try {
-      const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-      for (const p of initialData) {
-        const docRef = doc(db, 'patients', p.id);
-        await setDoc(docRef, p);
+      if (isLocalMode) {
+        setPatients(initialData);
+        addToast('已載入 10 筆範本資料（本地模式）', 'info');
+      } else {
+        for (const p of initialData) {
+          const docRef = doc(db, 'patients', p.id);
+          await setDoc(docRef, p);
+        }
+        addToast('已載入 10 筆範本資料', 'success');
       }
     } catch (e) {
       console.error('載入預設資料失敗', e);
+      setPatients(initialData);
+      setIsLocalMode(true);
+      addToast('載入失敗，已切換至本地模式', 'warning');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copyToClipboard = async (text, label) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      addToast(`${label} 已複製`, 'success');
+    } catch {
+      addToast(`複製失敗`, 'error');
     }
   };
 
@@ -219,28 +368,26 @@ export default function Dashboard() {
   };
 
   const renderSortIcon = (key) => {
-    if (sortConfig.key !== key) return <span className="text-gray-400 ml-1 text-xs opacity-50">↕</span>;
-    return sortConfig.direction === 'asc' ? <span className="text-emerald-600 ml-1 text-xs font-bold">↑</span> : <span className="text-emerald-600 ml-1 text-xs font-bold">↓</span>;
+    if (sortConfig.key !== key) return <span className="text-gray-400 ml-1 text-xs opacity-40">↕</span>;
+    return sortConfig.direction === 'asc' ? <span className="text-emerald-500 ml-1 text-xs font-bold">↑</span> : <span className="text-emerald-500 ml-1 text-xs font-bold">↓</span>;
   };
 
   const filteredPatients = useMemo(() => {
     const filtered = patients.filter(p => {
       const matchBranch = filterBranch === 'All' || p.targetBranch.includes(filterBranch) || p.targetBranch.includes('三院皆可');
       const matchStatus = filterStatus === 'All'
-        ? p.status !== '已刪除'  // 全部狀態時隱藏已刪除
+        ? p.status !== '已刪除'
         : p.status === filterStatus;
       const matchGender = filterGender === 'All' || p.gender === filterGender;
       const matchYear = filterYear === 'All' || (p.registerDate && p.registerDate.startsWith(filterYear));
 
       const keyword = searchQuery.trim().toLowerCase();
-
       const normalize = (str) => {
         const lowerStr = str.toLowerCase();
         return convertTwToCn ? convertTwToCn(lowerStr) : lowerStr;
       };
-
       const query = normalize(keyword);
-      const matchSearch = !query ||
+      const matchSearch = !debouncedQuery ||
         normalize(p.name).includes(query) ||
         p.contactPhone.includes(query) ||
         normalize(p.contactName).includes(query);
@@ -269,59 +416,28 @@ export default function Dashboard() {
     });
 
     return filtered;
-  }, [patients, filterBranch, filterStatus, filterGender, filterYear, searchQuery, convertTwToCn, sortConfig]);
+  }, [patients, filterBranch, filterStatus, filterGender, filterYear, debouncedQuery, convertTwToCn, sortConfig]);
 
-  const exportToJson = () => {
-    const jsonString = JSON.stringify(patients, null, 2);
-    const blob = new Blob([jsonString], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `輪候名單備份_${new Date().toISOString().split('T')[0]}.json`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+  const paginatedPatients = useMemo(() => {
+    const startIndex = (currentPage - 1) * pageSize;
+    return filteredPatients.slice(startIndex, startIndex + pageSize);
+  }, [filteredPatients, currentPage, pageSize]);
 
-  const handleImportJson = async (e) => {
-    const file = e.target.files[0];
-    if (!file || !user) return;
+  const totalPages = Math.ceil(filteredPatients.length / pageSize);
 
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const importedData = JSON.parse(event.target.result);
-        if (Array.isArray(importedData)) {
-          setLoading(true);
-          const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
-          await Promise.all(importedData.map(async (p) => {
-            if (p.id) {
-              const docRef = doc(db, 'patients', p.id);
-              await setDoc(docRef, p);
-            }
-          }));
-        }
-      } catch (err) {
-        console.error('解析或匯入 JSON 失敗:', err);
-      } finally {
-        setLoading(false);
-        if (fileInputRef.current) {
-          fileInputRef.current.value = '';
-        }
-      }
-    };
-    reader.readAsText(file);
-  };
+  // Reset to page 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterBranch, filterStatus, filterGender, filterYear, debouncedQuery]);
 
   const handleImportExcel = async (e) => {
     const files = e.target.files;
-    if (!files.length || !user) return;
+    if (!files.length) return;
     setLoading(true);
 
     try {
       const loadXLSX = new Function("return import('https://esm.sh/xlsx')");
       const XLSX = await loadXLSX();
-
       const writePromises = [];
       let totalImported = 0;
 
@@ -417,16 +533,16 @@ export default function Dashboard() {
             evaluationComments: String(row[colMap.evaluationComments] || '').trim()
           };
 
-          const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'care-home-app';
           const docRef = doc(db, 'patients', patient.id);
           writePromises.push(setDoc(docRef, patient));
           totalImported++;
         }
       }
       await Promise.all(writePromises);
-      console.log(`匯入完成，共處理 ${totalImported} 筆資料。`);
+      addToast(`匯入完成，共處理 ${totalImported} 筆資料`, 'success');
     } catch (error) {
       console.error('Excel 匯入失敗:', error);
+      addToast('Excel 匯入失敗', 'error');
     } finally {
       setLoading(false);
       if (excelInputRef.current) excelInputRef.current.value = '';
@@ -465,38 +581,41 @@ export default function Dashboard() {
   };
 
   const renderFormUI = (isEdit) => (
-    <form onSubmit={handleSubmit} className="space-y-6">
-      <div className="bg-slate-50 p-4 rounded border">
-        <h3 className="font-semibold mb-3 text-emerald-800 border-b pb-1">當前進度管理</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <form ref={formRef} onSubmit={handleSubmit} className="space-y-8">
+      <div className="bg-gradient-to-br from-slate-50 to-slate-100 p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <h3 className="font-bold text-lg text-slate-700 mb-4 flex items-center gap-2">
+          <span className="w-1.5 h-6 bg-emerald-500 rounded-full"></span>
+          當前進度管理
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           <div>
-            <label className="block text-sm font-medium text-gray-700">進度狀態</label>
-            <select name="status" value={formData.status} onChange={handleInputChange} className="mt-1 w-full border rounded p-2 focus:ring-emerald-500 font-bold">
+            <label className="block text-sm font-medium text-slate-600 mb-2">進度狀態</label>
+            <select name="status" value={formData.status} onChange={handleInputChange} className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all">
               {statuses.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">輪候院舍 (可多選)</label>
-            <div className="mt-2 flex flex-wrap gap-4">
+            <label className="block text-sm font-medium text-slate-600 mb-2">輪候院舍 (可多選)</label>
+            <div className="mt-2 flex flex-wrap gap-3">
               {branches.map(b => (
-                <label key={b} className="inline-flex items-center">
+                <label key={b} className="inline-flex items-center gap-2 cursor-pointer group">
                   <input
                     type="checkbox"
-                    className="form-checkbox h-4 w-4 text-emerald-600"
+                    className="form-checkbox h-4 w-4 text-emerald-500 rounded-md border-slate-300 focus:ring-emerald-400"
                     checked={formData.targetBranch.includes(b)}
                     onChange={() => handleBranchChange(b)}
                   />
-                  <span className="ml-2">{b}</span>
+                  <span className="text-slate-700 group-hover:text-emerald-600 transition-colors">{b}</span>
                 </label>
               ))}
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">評估預約時間</label>
-            <div className="mt-1 flex gap-2">
+            <label className="block text-sm font-medium text-slate-600 mb-2">評估預約時間</label>
+            <div className="flex gap-2">
               <input
                 type="date"
-                className="w-full border rounded p-2"
+                className="flex-1 border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all"
                 value={formData.evaluationDate ? formData.evaluationDate.split(' ')[0] : ''}
                 onChange={(e) => {
                   const newDate = e.target.value;
@@ -510,7 +629,7 @@ export default function Dashboard() {
                 }}
               />
               <select
-                className="w-full border rounded p-2"
+                className="w-20 border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all"
                 value={formData.evaluationDate && formData.evaluationDate.includes(' ') ? formData.evaluationDate.split(' ')[1].split(':')[0] : ''}
                 onChange={(e) => {
                   const newHour = e.target.value;
@@ -526,10 +645,10 @@ export default function Dashboard() {
                 }}
               >
                 <option value="">時</option>
-                {hourOptions.map(h => <option key={h} value={h}>{h}時</option>)}
+                {hourOptions.map(h => <option key={h} value={h}>{h}</option>)}
               </select>
               <select
-                className="w-full border rounded p-2"
+                className="w-20 border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all"
                 value={formData.evaluationDate && formData.evaluationDate.includes(' ') ? formData.evaluationDate.split(' ')[1].split(':')[1] : ''}
                 onChange={(e) => {
                   const newMin = e.target.value;
@@ -545,378 +664,488 @@ export default function Dashboard() {
                 }}
               >
                 <option value="">分</option>
-                {minuteOptions.map(m => <option key={m} value={m}>{m}分</option>)}
+                {minuteOptions.map(m => <option key={m} value={m}>{m}</option>)}
               </select>
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">登記日期</label>
-            <input type="date" name="registerDate" value={formData.registerDate} onChange={handleInputChange} required className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">登記日期 <span className="text-rose-400">*</span></label>
+            <input type="date" name="registerDate" value={formData.registerDate} onChange={handleInputChange} required className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all" />
           </div>
           <div className="md:col-span-2">
-            <label className="block text-sm font-medium text-gray-700">評估後意見 (供內部參考)</label>
-            <textarea name="evaluationComments" value={formData.evaluationComments} onChange={handleInputChange} rows="3" className="mt-1 w-full border rounded p-2 bg-yellow-50 placeholder-gray-400" placeholder="填寫適合或不適合的理由、家訪狀況、家屬期望等..."></textarea>
+            <label className="block text-sm font-medium text-slate-600 mb-2">評估後意見 (供內部參考)</label>
+            <textarea name="evaluationComments" value={formData.evaluationComments} onChange={handleInputChange} rows="3" className="w-full border border-slate-300 rounded-xl p-3 bg-amber-50 placeholder-slate-400 focus:ring-2 focus:ring-amber-300 focus:border-amber-400 shadow-sm transition-all" placeholder="填寫適合或不適合的理由、家訪狀況、家屬期望等..."></textarea>
           </div>
         </div>
       </div>
 
-      <div>
-        <h3 className="font-semibold mb-3 border-b pb-1">長者基本資料</h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <h3 className="font-bold text-lg text-slate-700 mb-4 flex items-center gap-2">
+          <span className="w-1.5 h-6 bg-sky-500 rounded-full"></span>
+          長者基本資料
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
           <div>
-            <label className="block text-sm font-medium text-gray-700">姓名</label>
-            <input type="text" name="name" value={formData.name} onChange={handleInputChange} required className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">姓名 <span className="text-rose-400">*</span></label>
+            <input type="text" name="name" value={formData.name} onChange={handleInputChange} required autoFocus={selectedPatient !== null} className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">性別</label>
-            <select name="gender" value={formData.gender} onChange={handleInputChange} className="mt-1 w-full border rounded p-2">
+            <label className="block text-sm font-medium text-slate-600 mb-2">性別</label>
+            <select name="gender" value={formData.gender} onChange={handleInputChange} className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all">
               <option value="男">男</option>
               <option value="女">女</option>
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">年齡</label>
-            <input type="number" name="age" value={formData.age} onChange={handleInputChange} required className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">年齡</label>
+            <input type="number" name="age" value={formData.age} onChange={handleInputChange} required min="0" max="150" className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all" />
           </div>
         </div>
       </div>
 
-      <div>
-        <h3 className="font-semibold mb-3 border-b pb-1">聯絡與居住資訊</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <h3 className="font-bold text-lg text-slate-700 mb-4 flex items-center gap-2">
+          <span className="w-1.5 h-6 bg-violet-500 rounded-full"></span>
+          聯絡與居住資訊
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           <div>
-            <label className="block text-sm font-medium text-gray-700">聯絡人 (關係)</label>
-            <input type="text" name="contactName" value={formData.contactName} onChange={handleInputChange} placeholder="例如: 陳先生(子)" required className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">聯絡人 (關係) <span className="text-rose-400">*</span></label>
+            <input type="text" name="contactName" value={formData.contactName} onChange={handleInputChange} placeholder="例如: 陳先生(子)" required className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">聯絡電話</label>
-            <input type="text" name="contactPhone" value={formData.contactPhone} onChange={handleInputChange} required className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">聯絡電話 <span className="text-rose-400">*</span></label>
+            <input type="text" name="contactPhone" value={formData.contactPhone} onChange={handleInputChange} required className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">所在區域</label>
-            <select name="region" value={formData.region} onChange={handleInputChange} className="mt-1 w-full border rounded p-2">
+            <label className="block text-sm font-medium text-slate-600 mb-2">所在區域</label>
+            <select name="region" value={formData.region} onChange={handleInputChange} className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 bg-white shadow-sm transition-all">
               <option value="">請選擇區域...</option>
               {regionOptions.map(r => <option key={r} value={r}>{r}</option>)}
             </select>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">家訪地址</label>
-            <input type="text" name="address" value={formData.address} onChange={handleInputChange} className="mt-1 w-full border rounded p-2" />
+            <label className="block text-sm font-medium text-slate-600 mb-2">家訪地址</label>
+            <input type="text" name="address" value={formData.address} onChange={handleInputChange} className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all" />
           </div>
         </div>
       </div>
 
-      <div>
-        <h3 className="font-semibold mb-3 border-b pb-1">病史與備註</h3>
-        <div className="grid grid-cols-1 gap-4">
+      <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+        <h3 className="font-bold text-lg text-slate-700 mb-4 flex items-center gap-2">
+          <span className="w-1.5 h-6 bg-rose-400 rounded-full"></span>
+          病史與備註
+        </h3>
+        <div className="grid grid-cols-1 gap-5">
           <div>
-            <label className="block text-sm font-medium text-gray-700">病史及身體狀況</label>
-            <textarea name="medicalHistory" value={formData.medicalHistory} onChange={handleInputChange} rows="2" className="mt-1 w-full border rounded p-2"></textarea>
+            <label className="block text-sm font-medium text-slate-600 mb-2">病史及身體狀況</label>
+            <textarea name="medicalHistory" value={formData.medicalHistory} onChange={handleInputChange} rows="2" className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all"></textarea>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700">其他備註</label>
-            <textarea name="remarks" value={formData.remarks} onChange={handleInputChange} rows="2" className="mt-1 w-full border rounded p-2"></textarea>
+            <label className="block text-sm font-medium text-slate-600 mb-2">其他備註</label>
+            <textarea name="remarks" value={formData.remarks} onChange={handleInputChange} rows="2" className="w-full border border-slate-300 rounded-xl p-3 focus:ring-2 focus:ring-emerald-400 focus:border-emerald-400 shadow-sm transition-all"></textarea>
           </div>
         </div>
       </div>
 
-      <div className="flex justify-end gap-4 pt-4 border-t">
+      <div className="flex justify-end gap-4 pt-4 border-t border-slate-200">
         {isEdit && (
-          <button type="button" onClick={() => setSelectedPatient(null)} className="px-6 py-2 border rounded text-gray-600 hover:bg-gray-100">取消</button>
+          <button type="button" onClick={() => setSelectedPatient(null)} className="px-6 py-3 border-2 border-slate-300 rounded-xl text-slate-600 hover:bg-slate-50 hover:border-slate-400 transition-all font-medium">取消</button>
         )}
-        <button type="submit" className="px-6 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 font-semibold">
-          儲存資料
+        <button type="submit" disabled={isSaving} className="px-8 py-3 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-xl hover:from-emerald-600 hover:to-emerald-700 font-semibold shadow-lg shadow-emerald-200 transition-all flex items-center gap-2 disabled:opacity-70">
+          {isSaving ? (
+            <>
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+              儲存中...
+            </>
+          ) : '儲存資料'}
         </button>
       </div>
     </form>
   );
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans pb-10">
-      <header className="bg-emerald-700 text-white p-2 sm:p-4 shadow-md sticky top-0 z-40">
-        <div className="flex flex-wrap justify-between items-center gap-2">
-          <h1 className="text-lg sm:text-xl font-bold">頤安三院輪候及評估管理系統</h1>
-          <div className="flex items-center gap-1 sm:gap-2 flex-wrap">
-          <span className="text-sm opacity-80 mr-2">{user?.email}</span>
-          {saveMessage && (
-            <span className={`text-sm font-semibold px-2 py-1 rounded ${saveMessage.includes('✗') ? 'bg-red-500' : 'bg-green-500'}`}>
-              {saveMessage}
-            </span>
-          )}
-          <button
-            onClick={handleLogout}
-            className="px-4 py-2 rounded bg-red-600 hover:bg-red-700 font-semibold"
-          >
-            登出
-          </button>
-          <div className="border-l border-emerald-500 h-6 mx-2"></div>
-          <button
-            onClick={() => { setActiveTab('list'); resetForm(); }}
-            className={`px-4 py-2 rounded ${activeTab === 'list' ? 'bg-emerald-900' : 'hover:bg-emerald-600'}`}
-          >
-            名單總覽
-          </button>
-          <button
-            onClick={() => { setActiveTab('new'); resetForm(); }}
-            className={`px-4 py-2 rounded ${activeTab === 'new' ? 'bg-emerald-900' : 'hover:bg-emerald-600'}`}
-          >
-            + 新增登記
-          </button>
+    <div className="min-h-screen bg-gradient-to-br from-slate-100 via-slate-50 to-emerald-50 text-slate-800 font-sans pb-12">
+      <header className="bg-gradient-to-r from-emerald-700 via-emerald-600 to-teal-600 text-white shadow-xl sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center gap-4">
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="w-9 h-9 bg-white/20 rounded-lg flex items-center justify-center backdrop-blur-sm">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"></path></svg>
+            </div>
+            <h1 className="text-lg font-bold tracking-tight whitespace-nowrap">頤安三院輪候系統</h1>
+            {isLocalMode && (
+              <span className="px-2 py-0.5 bg-amber-500 text-white text-xs rounded-full font-bold flex items-center gap-1 shadow-md">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                </svg>
+                本地模式
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+            <span className="text-sm opacity-80 whitespace-nowrap hidden md:inline">{user?.email}</span>
+            <button
+              onClick={handleLogout}
+              className="px-3 py-1.5 rounded-lg bg-rose-500/80 hover:bg-rose-600 font-medium backdrop-blur-sm transition-all text-sm whitespace-nowrap"
+            >
+              登出
+            </button>
+            <div className="w-px h-6 bg-white/30 mx-1"></div>
+            <button
+              onClick={() => { setActiveTab('list'); resetForm(); }}
+              className={`px-3 py-1.5 rounded-lg font-medium transition-all text-sm whitespace-nowrap ${activeTab === 'list' ? 'bg-white/20 backdrop-blur-sm shadow-lg' : 'hover:bg-white/10'}`}
+            >
+              名單總覽
+            </button>
+            <button
+              onClick={() => { setActiveTab('new'); resetForm(); }}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all text-sm whitespace-nowrap ${activeTab === 'new' ? 'bg-orange-500 shadow-lg shadow-orange-500/40' : 'bg-orange-500/80 hover:bg-orange-500 shadow-md hover:shadow-lg hover:shadow-orange-500/30'}`}
+              title="快捷鍵: Ctrl+N"
+            >
+              + 新增登記
+            </button>
 
-          {isAdmin && (
-            <>
-              <div className="border-l border-emerald-500 h-6 mx-2"></div>
-              <button
-                onClick={() => setActiveTab('admin')}
-                className={`px-4 py-2 rounded ${activeTab === 'admin' ? 'bg-purple-700' : 'bg-purple-600 hover:bg-purple-700'}`}
-              >
-                用戶管理
-              </button>
-            </>
-          )}
+            {isAdmin && (
+              <>
+                <div className="w-px h-6 bg-white/30 mx-1"></div>
+                <button
+                  onClick={() => setActiveTab('admin')}
+                  className={`px-3 py-1.5 rounded-lg font-medium transition-all text-sm whitespace-nowrap ${activeTab === 'admin' ? 'bg-purple-500/80 backdrop-blur-sm shadow-lg' : 'bg-purple-600/60 hover:bg-purple-600/80'}`}
+                >
+                  用戶管理
+                </button>
+              </>
+            )}
 
-          <div className="border-l border-emerald-500 h-6 mx-2"></div>
+            <div className="w-px h-6 bg-white/30 mx-1"></div>
 
-          <input
-            type="file"
-            accept=".json"
-            style={{ display: 'none' }}
-            ref={fileInputRef}
-            onChange={handleImportJson}
-          />
-          <input
-            type="file"
-            accept=".xlsx, .xls, .csv"
-            multiple
-            style={{ display: 'none' }}
-            ref={excelInputRef}
-            onChange={handleImportExcel}
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={loading}
-            className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 font-semibold disabled:opacity-50"
-          >
-            匯入 JSON
-          </button>
-          <button
-            onClick={exportToJson}
-            className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-700 font-semibold"
-          >
-            匯出 JSON
-          </button>
-          <button
-            onClick={() => excelInputRef.current?.click()}
-            disabled={loading}
-            className="px-4 py-2 rounded bg-amber-600 hover:bg-amber-700 font-semibold disabled:opacity-50"
-          >
-            導入 Excel
-          </button>
-          <button
-            onClick={exportToExcel}
-            className="px-4 py-2 rounded bg-amber-600 hover:bg-amber-700 font-semibold"
-          >
-            導出 Excel
-          </button>
+            <input
+              type="file"
+              accept=".xlsx, .xls, .csv"
+              multiple
+              style={{ display: 'none' }}
+              ref={excelInputRef}
+              onChange={handleImportExcel}
+            />
+            <button
+              onClick={() => excelInputRef.current?.click()}
+              disabled={loading || isLocalMode}
+              className="px-3 py-1.5 rounded-lg bg-white/10 backdrop-blur-sm hover:bg-white/20 font-medium disabled:opacity-50 transition-all text-sm whitespace-nowrap"
+              title={isLocalMode ? '本地模式無法導入 Excel' : ''}
+            >
+              導入
+            </button>
+            <button
+              onClick={exportToExcel}
+              className="px-3 py-1.5 rounded-lg bg-white/10 backdrop-blur-sm hover:bg-white/20 font-medium transition-all text-sm whitespace-nowrap"
+            >
+              導出
+            </button>
           </div>
         </div>
       </header>
 
       <main className="p-6 max-w-7xl mx-auto">
         {activeTab === 'list' && (
-          <div className="space-y-4">
-            <div className="bg-white p-4 rounded shadow flex flex-wrap gap-4 items-center">
-              <div>
-                <label className="text-sm font-semibold text-gray-600 block mb-1">輪候院舍</label>
-                <select className="border rounded p-2" value={filterBranch} onChange={e => setFilterBranch(e.target.value)}>
-                  <option value="All">全部</option>
-                  {branches.map(b => <option key={b} value={b}>{b}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-sm font-semibold text-gray-600 block mb-1">進度狀態</label>
-                <select className="border rounded p-2" value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>
-                  <option value="All">全部狀態</option>
-                  {statuses.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-sm font-semibold text-gray-600 block mb-1">性別</label>
-                <select className="border rounded p-2" value={filterGender} onChange={e => setFilterGender(e.target.value)}>
-                  <option value="All">全部</option>
-                  <option value="男">男</option>
-                  <option value="女">女</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-sm font-semibold text-gray-600 block mb-1">登記年份</label>
-                <select className="border rounded p-2" value={filterYear} onChange={e => setFilterYear(e.target.value)}>
-                  <option value="All">全部</option>
-                  {availableYears.map(y => <option key={y} value={y}>{y}年</option>)}
-                </select>
-              </div>
-              <div className="flex-grow">
-                <label className="text-sm font-semibold text-gray-600 block mb-1">關鍵字搜尋</label>
-                <input
-                  type="text"
-                  className="border rounded p-2 w-full max-w-sm"
-                  placeholder="輸入長者姓名、電話或聯絡人..."
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                />
-              </div>
-              <div className="ml-auto flex items-end">
-                <span className="text-sm text-gray-500 bg-gray-100 px-3 py-2 rounded">
-                  共 {filteredPatients.length} 筆資料
-                </span>
-              </div>
-            </div>
-
-            {/* 狀態統計 */}
-            <div className="bg-white rounded shadow p-4">
-              <h3 className="text-sm font-semibold text-gray-600 mb-3">各狀態統計</h3>
-              <div className="flex flex-wrap gap-2">
-                {statuses.filter(s => s !== '已刪除').map(status => (
-                  <span
-                    key={status}
-                    className={`px-3 py-1 rounded-full text-sm font-medium cursor-pointer transition-all ${
-                      filterStatus === status
-                        ? 'ring-2 ring-emerald-500'
-                        : 'hover:ring-1 ring-gray-300'
-                    } ${
-                      status === '適合輪候' ? 'bg-green-100 text-green-800' :
-                      status === '評估預約中' ? 'bg-blue-100 text-blue-800' :
-                      status === '新登記' ? 'bg-yellow-100 text-yellow-800' :
-                      status === '已入住' ? 'bg-purple-100 text-purple-800' :
-                      status === '已取消' ? 'bg-gray-200 text-gray-600' :
-                      'bg-gray-100 text-gray-700'
-                    }`}
-                    onClick={() => setFilterStatus(filterStatus === status ? 'All' : status)}
+          <div className="space-y-5">
+            <div className="bg-white/80 backdrop-blur-sm p-5 rounded-2xl shadow-lg border border-slate-200/50">
+              {/* Status filter chips */}
+              <div className="mb-4">
+                <label className="text-sm font-semibold text-slate-500 block mb-2">快速篩選狀態</label>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => setFilterStatus('All')}
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${filterStatus === 'All' ? 'bg-slate-700 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
                   >
-                    {status}: {statusCounts[status]}
+                    全部 ({patients.length})
+                  </button>
+                  {statuses.filter(s => s !== '已刪除').map(s => {
+                    const sStyle = statusStyles[s] || { bg: 'bg-gray-100', text: 'text-gray-600' };
+                    const isActive = filterStatus === s;
+                    return (
+                      <button
+                        key={s}
+                        onClick={() => setFilterStatus(isActive ? 'All' : s)}
+                        className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${isActive ? `${sStyle.bg} ${sStyle.text} ring-2 ring-offset-1 ring-slate-300` : `${sStyle.bg} ${sStyle.text} hover:ring-2 hover:ring-slate-200`}`}
+                      >
+                        {s} ({statusCounts[s] || 0})
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-5 items-end">
+                <div className="min-w-[140px]">
+                  <label className="text-sm font-semibold text-slate-500 block mb-2">輪候院舍</label>
+                  <select className="w-full border border-slate-200 rounded-xl p-2.5 bg-white shadow-sm focus:ring-2 focus:ring-emerald-300 focus:border-emerald-400 transition-all" value={filterBranch} onChange={e => setFilterBranch(e.target.value)}>
+                    <option value="All">全部</option>
+                    {branches.map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                </div>
+                <div className="min-w-[100px]">
+                  <label className="text-sm font-semibold text-slate-500 block mb-2">性別</label>
+                  <select className="w-full border border-slate-200 rounded-xl p-2.5 bg-white shadow-sm focus:ring-2 focus:ring-emerald-300 focus:border-emerald-400 transition-all" value={filterGender} onChange={e => setFilterGender(e.target.value)}>
+                    <option value="All">全部</option>
+                    <option value="男">男</option>
+                    <option value="女">女</option>
+                  </select>
+                </div>
+                <div className="min-w-[120px]">
+                  <label className="text-sm font-semibold text-slate-500 block mb-2">登記年份</label>
+                  <select className="w-full border border-slate-200 rounded-xl p-2.5 bg-white shadow-sm focus:ring-2 focus:ring-emerald-300 focus:border-emerald-400 transition-all" value={filterYear} onChange={e => setFilterYear(e.target.value)}>
+                    <option value="All">全部</option>
+                    {availableYears.map(y => <option key={y} value={y}>{y}年</option>)}
+                  </select>
+                </div>
+                <div className="flex-grow min-w-[280px]">
+                  <label className="text-sm font-semibold text-slate-500 block mb-2">關鍵字搜尋</label>
+                  <input
+                    type="text"
+                    className="w-full border border-slate-200 rounded-xl p-2.5 bg-white shadow-sm focus:ring-2 focus:ring-emerald-300 focus:border-emerald-400 transition-all"
+                    placeholder="輸入長者姓名、電話或聯絡人..."
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                  />
+                </div>
+                <div className="flex items-center gap-3">
+                  <select
+                    value={pageSize}
+                    onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+                    className="border border-slate-200 rounded-xl p-2 bg-white shadow-sm focus:ring-2 focus:ring-emerald-300 text-sm"
+                  >
+                    <option value={10}>10 筆/頁</option>
+                    <option value={25}>25 筆/頁</option>
+                    <option value={50}>50 筆/頁</option>
+                  </select>
+                  <span className="text-sm text-slate-500 bg-slate-100 px-4 py-2.5 rounded-xl font-medium">
+                    第 <span className="text-emerald-600 font-bold">{currentPage}</span>/<span className="text-emerald-600 font-bold">{totalPages || 1}</span> 頁，共 <span className="text-emerald-600 font-bold">{filteredPatients.length}</span> 筆
                   </span>
-                ))}
+                </div>
               </div>
             </div>
 
-            <div className="bg-white rounded shadow overflow-x-auto">
-              <table className="w-full text-left border-collapse min-w-[1200px]">
-                <thead className="bg-gray-100 border-b">
-                  <tr>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('status')}>
-                      狀態 {renderSortIcon('status')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('targetBranch')}>
-                      輪候院舍 {renderSortIcon('targetBranch')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('name')}>
-                      姓名 {renderSortIcon('name')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('region')}>
-                      所在區域 {renderSortIcon('region')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('gender')}>
-                      性別 {renderSortIcon('gender')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('age')}>
-                      年齡 {renderSortIcon('age')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('contactName')}>
-                      聯絡人 {renderSortIcon('contactName')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('registerDate')}>
-                      登記日期 {renderSortIcon('registerDate')}
-                    </th>
-                    <th className="p-3 font-semibold cursor-pointer hover:bg-gray-200 select-none transition-colors" onClick={() => requestSort('evaluationDate')}>
-                      家訪時間 {renderSortIcon('evaluationDate')}
-                    </th>
-                    <th className="p-3 font-semibold">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {loading ? (
-                    <tr><td colSpan="10" className="p-6 text-center text-gray-500">資料處理中...</td></tr>
-                  ) : filteredPatients.length === 0 ? (
-                    <tr>
-                      <td colSpan="10" className="p-6 text-center text-gray-500">
-                        查無符合條件之名單
-                        {patients.length === 0 && (
-                          <div className="mt-4">
-                            <p className="text-sm text-gray-400 mb-2">系統目前無任何資料。您可以點擊下方按鈕載入 10 筆預設測試資料。</p>
+            <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-slate-200/50 overflow-hidden">
+              <div className="overflow-x-auto">
+                <table ref={tableRef} className="w-full text-left border-collapse min-w-[1200px]">
+                  <thead>
+                    <tr className="bg-gradient-to-r from-slate-100 to-slate-50 border-b border-slate-200">
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('status')}>
+                        狀態 {renderSortIcon('status')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('targetBranch')}>
+                        輪候院舍 {renderSortIcon('targetBranch')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('name')}>
+                        姓名 {renderSortIcon('name')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('region')}>
+                        所在區域 {renderSortIcon('region')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('gender')}>
+                        性別 {renderSortIcon('gender')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('age')}>
+                        年齡 {renderSortIcon('age')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('contactName')}>
+                        聯絡人 {renderSortIcon('contactName')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('registerDate')}>
+                        登記日期 {renderSortIcon('registerDate')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600 cursor-pointer hover:bg-slate-200/50 select-none transition-colors" onClick={() => requestSort('evaluationDate')}>
+                        家訪時間 {renderSortIcon('evaluationDate')}
+                      </th>
+                      <th className="p-4 font-semibold text-slate-600">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loading ? (
+                      <tr>
+                        {[...Array(5)].map((_, i) => (
+                          <tr key={i} className="border-b border-slate-100 animate-pulse">
+                            <td className="p-4"><span className="px-3 py-1.5 rounded-full bg-slate-200 text-slate-200 text-xs">XXXXXXXX</span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-16 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-20 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-14 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-10 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-10 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-24 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-20 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-4 w-28 rounded"></span></td>
+                            <td className="p-4"><span className="bg-slate-200 h-8 w-16 rounded-lg"></span></td>
+                          </tr>
+                        ))}
+                      </tr>
+                    ) : filteredPatients.length === 0 ? (
+                      <tr>
+                        <td colSpan="10" className="p-12 text-center">
+                          <div className="text-slate-300 mb-4">
+                            <svg className="w-16 h-16 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path></svg>
+                          </div>
+                          <p className="text-slate-400 mb-4">查無符合條件之名單</p>
+                          {patients.length === 0 && (
                             <button
                               onClick={loadSampleData}
-                              className="px-4 py-2 bg-emerald-100 text-emerald-800 rounded hover:bg-emerald-200 font-semibold"
+                              className="px-6 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-xl hover:from-emerald-600 hover:to-teal-600 font-semibold shadow-lg shadow-emerald-200 transition-all"
                             >
                               載入 10 筆範本資料
                             </button>
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredPatients.map((p, idx) => (
-                      <React.Fragment key={p.id}>
-                        <tr
-                          className={`border-b transition-colors cursor-pointer ${selectedPatient?.id === p.id ? 'bg-emerald-100' : idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-emerald-50`}
-                          onClick={() => selectedPatient?.id === p.id ? setSelectedPatient(null) : openPatientModal(p)}
-                        >
-                          <td className="p-3">
-                            <span className={`px-2 py-1 text-xs rounded font-medium ${
-                              p.status === '已刪除' ? 'bg-red-100 text-red-800' :
-                              p.status === '已入住' ? 'bg-purple-100 text-purple-800' :
-                              p.status === '適合輪候' ? 'bg-green-100 text-green-800' :
-                              p.status === '評估預約中' ? 'bg-blue-100 text-blue-800' :
-                              p.status === '已取消' ? 'bg-gray-200 text-gray-600' :
-                              'bg-yellow-100 text-yellow-800'
-                            }`}>
-                              {p.status}
-                            </span>
-                          </td>
-                          <td className="p-3">{p.targetBranch.join('、')}</td>
-                          <td className="p-3 font-medium">{p.name}</td>
-                          <td className="p-3 text-sm text-gray-600">{p.region || '-'}</td>
-                          <td className="p-3">{p.gender}</td>
-                          <td className="p-3">{p.age}</td>
-                          <td className="p-3">{p.contactName} <br/><span className="text-sm text-gray-500">{p.contactPhone}</span></td>
-                          <td className="p-3">{p.registerDate}</td>
-                          <td className="p-3 text-sm text-blue-600">{p.evaluationDate || '-'}</td>
-                          <td className="p-3">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setPatientToDelete(p); }}
-                              className="px-3 py-1 bg-red-100 text-red-700 rounded hover:bg-red-200 text-sm font-semibold"
+                          )}
+                        </td>
+                      </tr>
+                    ) : (
+                      paginatedPatients.map((p, idx) => {
+                        const s = statusStyles[p.status] || { bg: 'bg-gray-100', text: 'text-gray-600', ring: 'ring-gray-200' };
+                        return (
+                          <React.Fragment key={p.id}>
+                            <tr
+                              className={`border-b border-slate-100 transition-all cursor-pointer ${selectedPatient?.id === p.id ? 'bg-emerald-50/70' : idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'} hover:bg-emerald-50/80`}
+                              onClick={() => selectedPatient?.id === p.id ? setSelectedPatient(null) : openPatientModal(p)}
+                              onDoubleClick={() => { openPatientModal(p); setActiveTab('new'); }}
                             >
-                              刪除
-                            </button>
-                          </td>
-                        </tr>
-                        {selectedPatient?.id === p.id && (
-                          <tr className="bg-white">
-                            <td colSpan="10" className="p-0 border-b-4 border-emerald-500 shadow-inner">
-                              <div className="p-6 bg-emerald-50/50">
-                                <div className="flex justify-between items-center mb-6 border-b border-emerald-200 pb-2">
-                                  <h3 className="text-xl font-bold text-emerald-800">正在編輯：{p.name} 的資料</h3>
-                                  <button onClick={() => setSelectedPatient(null)} className="text-emerald-600 hover:text-emerald-900 font-semibold">
-                                    ▲ 收起面板
+                              <td className="p-4">
+                                <span className={`px-3 py-1.5 text-xs rounded-full font-semibold ring-1 ring-inset ${s.bg} ${s.text} ${s.ring}`}>
+                                  {p.status}
+                                </span>
+                              </td>
+                              <td className="p-4 text-sm text-slate-600">{p.targetBranch.join('、')}</td>
+                              <td className="p-4 font-semibold text-slate-800">{p.name}</td>
+                              <td className="p-4 text-sm text-slate-500">{p.region || '-'}</td>
+                              <td className="p-4 text-sm text-slate-600">{p.gender}</td>
+                              <td className="p-4 text-sm text-slate-600">{p.age}</td>
+                              <td className="p-4 text-sm">
+                                <div className="flex items-center gap-1">
+                                  <span className="text-slate-700">{p.contactName}</span>
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); copyToClipboard(p.contactName, '聯絡人'); }}
+                                    className="p-1 text-slate-300 hover:text-emerald-500 transition-colors"
+                                    title="複製聯絡人"
+                                  >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
                                   </button>
                                 </div>
-                                {renderFormUI(true)}
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))
-                  )}
-                </tbody>
-              </table>
+                                <div className="flex items-center gap-1">
+                                  <a
+                                    href={`tel:${p.contactPhone}`}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="text-slate-400 text-xs hover:text-emerald-600 transition-colors"
+                                  >
+                                    {p.contactPhone}
+                                  </a>
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); copyToClipboard(p.contactPhone, '電話'); }}
+                                    className="p-1 text-slate-300 hover:text-emerald-500 transition-colors"
+                                    title="複製電話"
+                                  >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                                  </button>
+                                </div>
+                              </td>
+                              <td className="p-4 text-sm text-slate-600">{p.registerDate}</td>
+                              <td className="p-4 text-sm text-sky-600">{p.evaluationDate || '-'}</td>
+                              <td className="p-4">
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); setPatientToDelete(p); }}
+                                  className="px-4 py-2 bg-rose-50 text-rose-600 rounded-lg hover:bg-rose-100 text-sm font-semibold transition-all ring-1 ring-rose-200"
+                                >
+                                  刪除
+                                </button>
+                              </td>
+                            </tr>
+                            {selectedPatient?.id === p.id && (
+                              <tr className="bg-white">
+                                <td colSpan="10" className="p-0 border-b-4 border-emerald-400">
+                                  <div className="p-8 bg-gradient-to-br from-emerald-50/50 to-slate-50/50">
+                                    <div className="flex justify-between items-center mb-6 border-b border-emerald-100 pb-4">
+                                      <h3 className="text-xl font-bold text-slate-700 flex items-center gap-2">
+                                        <span className="w-2 h-2 bg-emerald-500 rounded-full"></span>
+                                        正在編輯：{p.name} 的資料
+                                      </h3>
+                                      <button onClick={() => setSelectedPatient(null)} className="text-slate-400 hover:text-slate-600 font-medium flex items-center gap-1 transition-colors">
+                                        收起 ▲
+                                      </button>
+                                    </div>
+                                    {renderFormUI(true)}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+
+                {/* Pagination */}
+                {totalPages > 1 && (
+                  <div className="flex justify-center items-center gap-2 py-4 border-t border-slate-200 bg-slate-50/50">
+                    <button
+                      onClick={() => setCurrentPage(1)}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-sm"
+                    >
+                      最首
+                    </button>
+                    <button
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-sm"
+                    >
+                      上一頁
+                    </button>
+                    {[...Array(Math.min(5, totalPages))].map((_, i) => {
+                      let pageNum;
+                      if (totalPages <= 5) {
+                        pageNum = i + 1;
+                      } else if (currentPage <= 3) {
+                        pageNum = i + 1;
+                      } else if (currentPage >= totalPages - 2) {
+                        pageNum = totalPages - 4 + i;
+                      } else {
+                        pageNum = currentPage - 2 + i;
+                      }
+                      return (
+                        <button
+                          key={pageNum}
+                          onClick={() => setCurrentPage(pageNum)}
+                          className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${currentPage === pageNum ? 'bg-emerald-500 text-white shadow-md' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-100'}`}
+                        >
+                          {pageNum}
+                        </button>
+                      );
+                    })}
+                    <button
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-sm"
+                    >
+                      下一頁
+                    </button>
+                    <button
+                      onClick={() => setCurrentPage(totalPages)}
+                      disabled={currentPage === totalPages}
+                      className="px-3 py-1.5 rounded-lg bg-white border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-sm"
+                    >
+                      最尾
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
 
         {activeTab === 'new' && (
-          <div className="bg-white p-6 rounded shadow max-w-4xl mx-auto">
-            <div className="flex justify-between items-center mb-6 border-b pb-4">
-              <h2 className="text-2xl font-bold">新增輪候登記</h2>
+          <div className="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-xl border border-slate-200/50 max-w-4xl mx-auto">
+            <div className="flex justify-between items-center mb-8 border-b border-slate-200 pb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-gradient-to-br from-emerald-400 to-teal-500 rounded-xl flex items-center justify-center text-white shadow-lg">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                </div>
+                <h2 className="text-2xl font-bold text-slate-700">新增輪候登記</h2>
+              </div>
             </div>
             {renderFormUI(false)}
           </div>
@@ -927,25 +1156,59 @@ export default function Dashboard() {
         )}
       </main>
 
+      {/* Mobile Bottom Navigation */}
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-4 py-2 md:hidden z-50 safe-area-bottom">
+        <div className="flex justify-around items-center max-w-lg mx-auto">
+          <button
+            onClick={() => { setActiveTab('list'); resetForm(); }}
+            className={`flex flex-col items-center gap-1 p-2 rounded-xl transition-all ${activeTab === 'list' ? 'text-emerald-600' : 'text-slate-400 hover:text-slate-600'}`}
+          >
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
+            <span className="text-xs font-medium">名單</span>
+          </button>
+          <button
+            onClick={() => { setActiveTab('new'); resetForm(); }}
+            className={`flex flex-col items-center gap-1 p-2 rounded-xl transition-all ${activeTab === 'new' ? 'text-orange-600' : 'text-slate-400 hover:text-slate-600'}`}
+          >
+            <div className={`w-12 h-12 -mt-6 rounded-full flex items-center justify-center shadow-lg ${activeTab === 'new' ? 'bg-orange-500 text-white' : 'bg-orange-100 text-orange-500'}`}>
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+            </div>
+            <span className="text-xs font-medium">新增</span>
+          </button>
+          {isAdmin && (
+            <button
+              onClick={() => setActiveTab('admin')}
+              className={`flex flex-col items-center gap-1 p-2 rounded-xl transition-all ${activeTab === 'admin' ? 'text-purple-600' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+              <span className="text-xs font-medium">管理</span>
+            </button>
+          )}
+        </div>
+      </nav>
+
       {patientToDelete && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white p-6 rounded shadow-lg max-w-sm w-full">
-            <h3 className="text-xl font-bold mb-4 text-gray-800">確認移至已刪除</h3>
-            <p className="text-gray-600 mb-6">
-              確定要將長者 <strong>{patientToDelete.name}</strong> 的資料移至「已刪除」狀態嗎？
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-8 transform transition-all">
+            <div className="w-16 h-16 bg-rose-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <svg className="w-8 h-8 text-rose-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </div>
+            <h3 className="text-xl font-bold text-slate-700 text-center mb-2">確認移至已刪除</h3>
+            <p className="text-slate-500 text-center mb-8">
+              確定要將長者 <strong className="text-slate-700">{patientToDelete.name}</strong> 的資料移至「已刪除」狀態嗎？
             </p>
-            <div className="flex justify-end gap-3">
+            <div className="flex gap-3">
               <button
                 onClick={() => setPatientToDelete(null)}
-                className="px-4 py-2 border rounded text-gray-600 hover:bg-gray-100 font-semibold"
+                className="flex-1 px-4 py-3 border-2 border-slate-200 rounded-xl text-slate-600 hover:bg-slate-50 hover:border-slate-300 font-medium transition-all"
               >
                 取消
               </button>
               <button
                 onClick={confirmDelete}
-                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 font-semibold"
+                className="flex-1 px-4 py-3 bg-gradient-to-r from-rose-500 to-rose-600 text-white rounded-xl hover:from-rose-600 hover:to-rose-700 font-semibold shadow-lg shadow-rose-200 transition-all"
               >
-                確定移至已刪除
+                確定刪除
               </button>
             </div>
           </div>
